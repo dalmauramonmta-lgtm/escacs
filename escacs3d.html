@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="ca">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Escacs 3D</title>
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#10161c;color:#eee;font-family:system-ui,sans-serif;touch-action:none}
+canvas{display:block;width:100%;height:100%}
+#st{position:fixed;top:0;left:0;right:0;padding:calc(env(safe-area-inset-top,0px) + 8px) 12px 8px;background:rgba(16,22,28,.75);font-size:15px;line-height:1.35;pointer-events:none}
+#bt{position:fixed;bottom:0;left:0;right:0;display:flex;flex-wrap:wrap;gap:8px;justify-content:center;padding:8px 8px calc(env(safe-area-inset-bottom,0px) + 10px);background:rgba(16,22,28,.75)}
+button,select{font-size:15px;padding:9px 12px;border-radius:10px;border:1px solid #456;background:#1f2d3a;color:#eee}
+</style>
+</head>
+<body>
+<div id="st">Carregant…</div>
+<div id="bt">
+<select id="side"><option value="w">Blanques</option><option value="b">Negres</option></select>
+<select id="lv"><option value="3">Fàcil</option><option value="10" selected>Mitjà</option><option value="17">Difícil</option><option value="20">Màxim</option></select>
+<button id="nw">Nova</button><button id="un">Desfés</button>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+<script>
+const game = new Chess();
+let human = 'w', sel = null, targets = [], last = null, thinking = false;
+let eng = null, engOK = false, ev = '', lvl = 10;
+
+/* ---------- escena ---------- */
+const R = new THREE.WebGLRenderer({antialias: true});
+R.setPixelRatio(Math.min(devicePixelRatio, 2));
+R.shadowMap.enabled = true;
+document.body.appendChild(R.domElement);
+const S = new THREE.Scene();
+S.background = new THREE.Color(0x10161c);
+const C = new THREE.PerspectiveCamera(40, 1, .1, 100);
+let yaw = 0, pitch = 1.0, dist = 13;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+function cam() {
+  C.position.set(3.5 + dist * Math.cos(pitch) * Math.sin(yaw), dist * Math.sin(pitch),
+                 3.5 + dist * Math.cos(pitch) * Math.cos(yaw));
+  C.lookAt(3.5, 0, 3.5);
+}
+function resize() {
+  R.setSize(innerWidth, innerHeight);
+  C.aspect = innerWidth / innerHeight;
+  C.fov = C.aspect < 1 ? 58 : 40;
+  C.updateProjectionMatrix();
+}
+addEventListener('resize', resize);
+
+S.add(new THREE.HemisphereLight(0xffffff, 0x334455, .75));
+const sun = new THREE.DirectionalLight(0xffffff, .9);
+sun.position.set(-4, 12, 4);
+sun.castShadow = true;
+sun.shadow.mapSize.set(1024, 1024);
+Object.assign(sun.shadow.camera, {left: -7, right: 7, top: 7, bottom: -7, near: 1, far: 30});
+sun.target.position.set(3.5, 0, 3.5);
+S.add(sun, sun.target);
+
+const table = new THREE.Mesh(new THREE.BoxGeometry(40, .5, 40), new THREE.MeshStandardMaterial({color: 0x1e4036}));
+table.position.set(3.5, -.75, 3.5); table.receiveShadow = true; S.add(table);
+const frame = new THREE.Mesh(new THREE.BoxGeometry(9.3, .3, 9.3), new THREE.MeshStandardMaterial({color: 0x4a2c17}));
+frame.position.set(3.5, -.3, 3.5); frame.receiveShadow = true; S.add(frame);
+
+const FILES = 'abcdefgh';
+const sqM = {};
+const bx = n => FILES.indexOf(n[0]), bz = n => 8 - +n[1];   // z = 7 - rank0 = 8 - rank
+for (let f = 0; f < 8; f++) for (let r = 1; r <= 8; r++) {
+  const n = FILES[f] + r;
+  const m = new THREE.Mesh(new THREE.BoxGeometry(.99, .2, .99), new THREE.MeshStandardMaterial({color: 0xffffff, roughness: .6}));
+  m.position.set(f, -.1, 8 - r); m.receiveShadow = true;
+  m.userData = {sq: n, c: (f + r) % 2 === 1 ? 0x8b5a2b : 0xe9d5ae};
+  S.add(m); sqM[n] = m;
+}
+
+/* ---------- peces (perfils de revolució) ---------- */
+const PF = {
+  p: [[0,0],[.34,0],[.34,.08],[.22,.16],[.13,.32],[.2,.4],[.12,.46],[.17,.58],[.15,.68],[.07,.76],[0,.78]],
+  r: [[0,0],[.37,0],[.37,.1],[.25,.18],[.2,.55],[.3,.62],[.3,.8],[0,.8]],
+  n: [[0,0],[.38,0],[.38,.1],[.28,.2],[.22,.42],[0,.42]],
+  b: [[0,0],[.37,0],[.37,.1],[.25,.18],[.14,.5],[.26,.62],[.14,.72],[.2,.88],[.1,1.08],[.04,1.14],[0,1.14]],
+  q: [[0,0],[.38,0],[.38,.1],[.26,.2],[.16,.62],[.32,.82],[.2,.88],[.2,.98],[.34,1.16],[.1,1.16],[.1,1.22],[.14,1.32],[0,1.36]],
+  k: [[0,0],[.38,0],[.38,.1],[.26,.2],[.16,.65],[.32,.85],[.22,.92],[.22,1.02],[.3,1.17],[.16,1.17],[0,1.2]]
+};
+const geoCache = {};
+function mk(t, w) {
+  const g = new THREE.Group();
+  const m = new THREE.MeshStandardMaterial({color: w ? 0xf3ece0 : 0x2b2b33, roughness: .35, metalness: .15});
+  const add = (geo, x, y, z, rx) => {
+    const o = new THREE.Mesh(geo, m);
+    o.position.set(x, y, z); if (rx) o.rotation.x = rx;
+    o.castShadow = true; g.add(o); return o;
+  };
+  geoCache[t] = geoCache[t] || new THREE.LatheGeometry(PF[t].map(a => new THREE.Vector2(a[0], a[1])), 28);
+  add(geoCache[t], 0, 0, 0);
+  const B = (a, b, c) => new THREE.BoxGeometry(a, b, c);
+  if (t === 'r') for (const x of [-.2, .2]) for (const z of [-.2, .2]) add(B(.13, .12, .13), x, .86, z);
+  if (t === 'k') { add(B(.1, .36, .1), 0, 1.38, 0); add(B(.3, .09, .1), 0, 1.42, 0); }
+  if (t === 'n') {
+    add(B(.3, .62, .44), 0, .7, 0, .3);
+    add(B(.24, .2, .34), 0, .96, -.26, -.25);
+    add(B(.08, .14, .08), -.08, 1.08, .08); add(B(.08, .14, .08), .08, 1.08, .08);
+    if (!w) g.rotation.y = Math.PI;
+  }
+  g.scale.setScalar(.95);
+  return g;
+}
+const pg = new THREE.Group(); S.add(pg);
+function sync(anim) {
+  while (pg.children.length) pg.remove(pg.children[0]);
+  game.board().forEach((row, i) => row.forEach((p, j) => {
+    if (!p) return;
+    const n = FILES[j] + (8 - i);
+    const g = mk(p.type, p.color === 'w');
+    g.position.set(j, 0, i); g.userData.sq = n;
+    g.userData.base = g.position.clone();
+    g.userData.off = new THREE.Vector3();
+    if (anim && n === anim.to) g.userData.off.set(bx(anim.from) - j, 0, bz(anim.from) - i);
+    pg.add(g);
+  }));
+  paint();
+}
+function paint() {
+  for (const n in sqM) sqM[n].material.color.setHex(sqM[n].userData.c);
+  if (last) [last.from, last.to].forEach(s => sqM[s].material.color.setHex(0xc9c24a));
+  if (sel) sqM[sel].material.color.setHex(0x4aa3df);
+  targets.forEach(s => sqM[s].material.color.setHex(game.get(s) ? 0xd9534f : 0x5cb85c));
+  if (game.in_check()) game.board().forEach((row, i) => row.forEach((p, j) => {
+    if (p && p.type === 'k' && p.color === game.turn()) sqM[FILES[j] + (8 - i)].material.color.setHex(0xff3b30);
+  }));
+  status();
+}
+
+/* ---------- estat ---------- */
+function status() {
+  const t = game.turn() === 'w' ? 'blanques' : 'negres';
+  let s = engOK ? 'Stockfish 19 (nivell ' + lvl + ')' : 'IA bàsica (Stockfish no carregat)';
+  if (game.in_checkmate()) s += '<br>Escac mat! Guanyen les ' + (game.turn() === 'w' ? 'negres' : 'blanques');
+  else if (game.game_over()) s += '<br>Taules';
+  else s += '<br>Torn: ' + t + (game.in_check() ? ' – ESCAC!' : '') + (thinking ? ' · pensant…' : '');
+  if (ev) s += '<br>Avaluació (blanques): ' + ev;
+  document.getElementById('st').innerHTML = s;
+}
+function fixMate() { /* text de guanyador correcte */ }
+
+/* ---------- jugar ---------- */
+function play(from, to, promo) {
+  const m = game.move({from, to, promotion: promo || 'q'});
+  if (!m) return false;
+  last = m; sel = null; targets = [];
+  sync(m); engineTurn();
+  return true;
+}
+function engineTurn() {
+  if (game.game_over() || game.turn() === human) { thinking = false; status(); return; }
+  thinking = true; status();
+  if (engOK) {
+    eng.postMessage('position fen ' + game.fen());
+    eng.postMessage('go movetime 1000');
+  } else setTimeout(() => {
+    const m = simple();
+    thinking = false;
+    if (m) play(m.from, m.to, m.promotion);
+  }, 60);
+}
+function tap(x, y) {
+  if (thinking || game.game_over() || game.turn() !== human) return;
+  const rc = new THREE.Raycaster();
+  rc.setFromCamera(new THREE.Vector2(x / innerWidth * 2 - 1, -(y / innerHeight) * 2 + 1), C);
+  const hit = rc.intersectObjects([...pg.children, ...Object.values(sqM)], true)[0];
+  let o = hit && hit.object, sq = null;
+  while (o) { if (o.userData && o.userData.sq) { sq = o.userData.sq; break; } o = o.parent; }
+  if (!sq) { sel = null; targets = []; return paint(); }
+  if (sel && targets.includes(sq)) return void play(sel, sq);
+  const p = game.get(sq);
+  if (p && p.color === game.turn()) {
+    sel = sq; targets = game.moves({square: sq, verbose: true}).map(m => m.to);
+  } else { sel = null; targets = []; }
+  paint();
+}
+
+/* ---------- IA bàsica (reserva) ---------- */
+const V = {p: 1, n: 3, b: 3, r: 5, q: 9, k: 0};
+function evalB() {
+  let s = 0;
+  for (const r of game.board()) for (const p of r) if (p) s += (p.color === 'w' ? 1 : -1) * V[p.type];
+  return s * (game.turn() === 'w' ? 1 : -1);
+}
+function mm(d, a, b) {
+  if (d === 0) return evalB();
+  const ms = game.moves();
+  if (!ms.length) return game.in_check() ? -99 - d : 0;
+  let best = -1e9;
+  for (const m of ms) {
+    game.move(m); const v = -mm(d - 1, -b, -a); game.undo();
+    if (v > best) best = v;
+    if (best > a) a = best;
+    if (a >= b) break;
+  }
+  return best;
+}
+function simple() {
+  let best = null, bv = -1e9;
+  for (const m of game.moves({verbose: true}).sort(() => Math.random() - .5)) {
+    game.move(m); const v = -mm(1, -1e9, 1e9); game.undo();
+    if (v > bv) { bv = v; best = m; }
+  }
+  return best;
+}
+
+/* ---------- Stockfish 19 (WASM, en un Worker) ---------- */
+async function initEngine() {
+  const bases = ['https://cdn.jsdelivr.net/npm/stockfish@19.0.1/src/', 'https://cdn.jsdelivr.net/npm/stockfish@19.0.1/'];
+  for (const b of bases) {
+    try {
+      const r = await fetch(b + 'stockfish-19-lite-single.js');
+      if (!r.ok) continue;
+      const js = await r.text();
+      const url = URL.createObjectURL(new Blob([js], {type: 'text/javascript'})) + '#' + b + 'stockfish-19-lite-single.wasm';
+      const w = new Worker(url);
+      const ok = await new Promise(res => {
+        const to = setTimeout(() => res(false), 20000);
+        w.onmessage = e => {
+          const l = String(e.data);
+          if (l === 'uciok') w.postMessage('isready');
+          if (l === 'readyok') { clearTimeout(to); res(true); }
+        };
+        w.onerror = () => res(false);
+        w.postMessage('uci');
+      });
+      if (!ok) { w.terminate(); continue; }
+      eng = w; engOK = true;
+      w.onmessage = e => {
+        const l = String(e.data);
+        const m = l.match(/score (cp|mate) (-?\d+)/);
+        if (m) {
+          const k = (game.turn() === 'w' ? 1 : -1) * +m[2];
+          ev = m[1] === 'cp' ? (k / 100).toFixed(2) : 'mat en ' + Math.abs(m[2]);
+        }
+        if (l.startsWith('bestmove')) {
+          const u = l.split(' ')[1];
+          thinking = false;
+          if (u && u !== '(none)') play(u.slice(0, 2), u.slice(2, 4), u[4]);
+          else status();
+        }
+      };
+      setLevel();
+      return;
+    } catch (e) { /* prova la següent ruta */ }
+  }
+}
+function setLevel() {
+  lvl = +document.getElementById('lv').value;
+  if (engOK) eng.postMessage('setoption name Skill Level value ' + lvl);
+  status();
+}
+
+/* ---------- controls ---------- */
+const cv = R.domElement, P = new Map();
+let moved = 0;
+cv.addEventListener('pointerdown', e => { cv.setPointerCapture(e.pointerId); P.set(e.pointerId, [e.clientX, e.clientY]); moved = 0; });
+cv.addEventListener('pointermove', e => {
+  if (!P.has(e.pointerId)) return;
+  const o = P.get(e.pointerId), n = [e.clientX, e.clientY];
+  if (P.size === 1) {
+    yaw -= (n[0] - o[0]) * .008; pitch = clamp(pitch + (n[1] - o[1]) * .006, .25, 1.45);
+    moved += Math.abs(n[0] - o[0]) + Math.abs(n[1] - o[1]);
+  } else if (P.size === 2) {
+    const q = [...P.entries()].find(([id]) => id !== e.pointerId)[1];
+    dist = clamp(dist * Math.hypot(o[0] - q[0], o[1] - q[1]) / Math.max(1, Math.hypot(n[0] - q[0], n[1] - q[1])), 7, 22);
+    moved = 99;
+  }
+  P.set(e.pointerId, n);
+});
+const up = e => { if (P.size === 1 && moved < 10 && e.type === 'pointerup') tap(e.clientX, e.clientY); P.delete(e.pointerId); };
+cv.addEventListener('pointerup', up); cv.addEventListener('pointercancel', up);
+cv.addEventListener('wheel', e => { dist = clamp(dist + e.deltaY * .01, 7, 22); });
+
+function nova() {
+  game.reset(); sel = null; targets = []; last = null; ev = ''; thinking = false;
+  human = document.getElementById('side').value;
+  yaw = human === 'w' ? 0 : Math.PI;
+  setLevel(); sync(); engineTurn();
+}
+document.getElementById('nw').onclick = nova;
+document.getElementById('lv').onchange = setLevel;
+document.getElementById('side').onchange = nova;
+document.getElementById('un').onclick = () => {
+  if (thinking) return;
+  game.undo(); if (game.turn() !== human) game.undo();
+  last = null; sel = null; targets = []; sync();
+};
+
+resize(); sync();
+(function loop() {
+  requestAnimationFrame(loop);
+  for (const g of pg.children) {
+    const o = g.userData.off;
+    if (o && o.lengthSq() > 1e-4) o.multiplyScalar(.82); else if (o) o.set(0, 0, 0);
+    if (o) g.position.copy(g.userData.base).add(o);
+  }
+  cam(); R.render(S, C);
+})();
+initEngine().then(status);
+</script>
+</body>
+</html>
