@@ -231,6 +231,8 @@ async function initEngine() {
       });
       if (!ok) { w.terminate(); continue; }
       eng = w; engOK = true;
+      const rawPost = w.postMessage.bind(w);
+      w.postMessage = m => rawPost(typeof m === 'string' && m.startsWith('go') ? 'go movetime ' + Math.min(6000, Math.max(500, lvl * 250)) : m);
       w.onmessage = e => {
         const l = String(e.data);
         const m = l.match(/score (cp|mate) (-?\d+)/);
