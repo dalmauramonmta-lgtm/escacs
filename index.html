@@ -211,7 +211,7 @@ function simple() {
 
 /* ---------- Stockfish 19 (WASM, en un Worker) ---------- */
 async function initEngine() {
-  const bases = ['https://cdn.jsdelivr.net/npm/stockfish@19.0.1/src/', 'https://cdn.jsdelivr.net/npm/stockfish@19.0.1/'];
+  const bases = ['https://cdn.jsdelivr.net/npm/stockfish@19.0.1/bin/', 'https://unpkg.com/stockfish@19.0.1/bin/', 'https://cdn.jsdelivr.net/npm/stockfish@19.0.1/src/'];
   for (const b of bases) {
     try {
       const r = await fetch(b + 'stockfish-19-lite-single.js');
